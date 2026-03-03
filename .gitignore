@@ -1,0 +1,21 @@
+# Build outputs
+market_data
+*.o
+*.a
+*.so
+
+# Editor/IDE
+.vscode/
+*.swp
+*~
+
+# Debug
+*.dSYM/
+core
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
