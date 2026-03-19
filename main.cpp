@@ -1,5 +1,6 @@
 // AF_XDP Market Data Ingestion Pipeline
 // Zero-allocation, nanosecond-optimized for WSL2 (SKB mode)
+// Multi-Symbol MBO Architecture with O(1) LFU Cache
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +23,8 @@
 #include <bpf/libbpf.h>
 
 #include "types.hpp"
+#include "trie.hpp"
+#include "lfu_cache.hpp"
 
 // Configuration constants
 static constexpr const char* INTERFACE_NAME = "veth0";
@@ -337,9 +340,22 @@ int main(int argc, char *argv[]) {
     // Populate fill ring with initial frame addresses
     populate_fill_ring(&fill_ring, NUM_FRAMES / 2);
 
-    // Initialize the order book (zero-allocation, on stack or BSS)
-    static PriceLevelBook book;  // Static to ensure BSS allocation
-    book.init();
+    // ========================================
+    // MBO Architecture Initialization
+    // All static - zero heap allocation
+    // ========================================
+    static OrderPool order_pool;        // 1M pre-allocated orders
+    static PrefixTrie symbol_trie;      // O(1) symbol→book_id routing
+    static LFUCache lfu_cache;          // O(1) LFU with 5 cached MBOBookWithBIT
+
+    order_pool.init();
+    symbol_trie.init();
+    lfu_cache.init(&order_pool);
+
+    printf("MBO subsystem initialized:\n");
+    printf("  - OrderPool: %u slots\n", OrderPool::MAX_ORDERS);
+    printf("  - SymbolTrie: O(1) routing\n");
+    printf("  - LFUCache: %u active books\n", MAX_CACHE_SIZE);
 
     printf("\n=== Starting Hot Loop ===\n");
     printf("Press Ctrl+C to stop\n\n");
@@ -351,6 +367,7 @@ int main(int argc, char *argv[]) {
     uint64_t total_trades = 0;
     uint64_t parse_failures = 0;
     uint64_t last_print_packets = 0;
+    uint64_t unique_symbols = 0;
 
     // Poll setup for blocking wait (optional, can busy-poll instead)
     struct pollfd fds[1];
@@ -400,15 +417,53 @@ int main(int argc, char *argv[]) {
             memcpy(&local_msg, msg, sizeof(ITCH_Message));
             itch_to_host(&local_msg);
             
-            // Process the message
-            book.process(&local_msg);
+            // ========================================
+            // MBO ROUTING - O(1) symbol lookup → O(1) cache access
+            // ========================================
             
-            // Update stats
+            // 1. Look up symbol → book_id (O(1) trie lookup)
+            bool created = false;
+            uint16_t book_id = symbol_trie.get_or_create(local_msg.symbol, &created);
+            if (created) {
+                ++unique_symbols;
+            }
+            
+            // 2. Access MBO book via LFU cache (O(1) access/evict)
+            MBOBookWithBIT* book = lfu_cache.access(book_id, local_msg.symbol);
+            if (!book) {
+                ++parse_failures;
+                continue;
+            }
+            
+            // 3. Route message to appropriate book operation
             if (local_msg.type == 'A') {
+                // Add order - determine side from price heuristic
+                // In real ITCH, there's a side field; here we use price vs mid
+                uint32_t mid = (book->get_best_bid() + book->get_best_ask()) / 2;
+                if (mid == 0) mid = 50000;  // Default mid if no BBO yet
+                
+                // Generate order_id from timestamp + price
+                uint64_t order_id = (static_cast<uint64_t>(local_msg.ts_ns) << 32) | local_msg.price;
+                
+                if (local_msg.price <= mid) {
+                    book->enqueue_bid(local_msg.price, order_id, local_msg.qty);
+                } else {
+                    book->enqueue_ask(local_msg.price, order_id, local_msg.qty);
+                }
                 ++total_adds;
             } else if (local_msg.type == 'T') {
+                // Trade execution - consume from front of queue
+                uint32_t mid = (book->get_best_bid() + book->get_best_ask()) / 2;
+                if (mid == 0) mid = 50000;
+                
+                if (local_msg.price <= mid) {
+                    book->trade_bid(local_msg.price, local_msg.qty);
+                } else {
+                    book->trade_ask(local_msg.price, local_msg.qty);
+                }
                 ++total_trades;
             }
+            
             ++total_packets;
         }
 
@@ -425,12 +480,10 @@ int main(int argc, char *argv[]) {
 
         // Print stats periodically
         if (total_packets - last_print_packets >= 10000) {
-            printf("Received: %lu | Parsed: %lu | Adds: %lu | Trades: %lu | "
-                   "Best Bid: %u | Best Ask: %u | Spread: %u\n",
-                   total_received, total_packets, total_adds, total_trades,
-                   book.best_bid, 
-                   book.best_ask == PriceLevelBook::INVALID_PRICE ? 0 : book.best_ask,
-                   book.spread());
+            printf("Pkts: %lu | Symbols: %lu | Cache: %.1f%% hit | Orders: %u active\n",
+                   total_packets, unique_symbols, 
+                   lfu_cache.hit_rate() * 100.0,
+                   order_pool.get_active_count());
             last_print_packets = total_packets;
         }
     }
@@ -442,11 +495,13 @@ int main(int argc, char *argv[]) {
     printf("Parse Failures: %lu\n", parse_failures);
     printf("Total Adds: %lu\n", total_adds);
     printf("Total Trades: %lu\n", total_trades);
-    printf("Book Adds: %lu\n", book.total_adds);
-    printf("Book Trades: %lu\n", book.total_trades);
-    printf("Best Bid: %u\n", book.best_bid);
-    printf("Best Ask: %u\n", book.best_ask == PriceLevelBook::INVALID_PRICE ? 0 : book.best_ask);
-    printf("Spread: %u ticks\n", book.spread());
+    printf("\n--- MBO Subsystem ---\n");
+    printf("Unique Symbols: %lu\n", unique_symbols);
+    printf("Active Orders: %u\n", order_pool.get_active_count());
+    printf("LFU Cache Hits: %lu\n", lfu_cache.get_hits());
+    printf("LFU Cache Misses: %lu\n", lfu_cache.get_misses());
+    printf("LFU Cache Evictions: %lu\n", lfu_cache.get_evictions());
+    printf("LFU Hit Rate: %.2f%%\n", lfu_cache.hit_rate() * 100.0);
 
     cleanup();
     return 0;

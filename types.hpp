@@ -4,15 +4,16 @@
 #include <cstring>
 #include <limits>
 
-// 17-byte Toy ITCH message - packed, big-endian on wire
+// 25-byte Multi-Symbol ITCH message - packed, big-endian on wire
 struct __attribute__((packed)) ITCH_Message {
-    char     type;      // 'A' = Add, 'T' = Trade
-    uint64_t ts_ns;     // Timestamp in nanoseconds
-    uint32_t price;     // Price in ticks
-    uint32_t qty;       // Quantity
+    char     type;        // 'A' = Add, 'T' = Trade
+    char     symbol[8];   // Ticker symbol (e.g., "BTC/USDT")
+    uint64_t ts_ns;       // Timestamp in nanoseconds
+    uint32_t price;       // Price in ticks
+    uint32_t qty;         // Quantity
 };
 
-static_assert(sizeof(ITCH_Message) == 17, "ITCH_Message must be exactly 17 bytes");
+static_assert(sizeof(ITCH_Message) == 25, "ITCH_Message must be exactly 25 bytes");
 
 // Byte order conversion helpers
 inline uint64_t ntohll(uint64_t val) {

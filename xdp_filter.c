@@ -89,9 +89,9 @@ int xdp_market_data_filter(struct xdp_md *ctx) {
 
     // Check if this is our target port (market data on UDP 1234)
     if (bpf_ntohs(udp->dest) == MARKET_DATA_PORT) {
-        // Verify we have enough data for the ITCH message (17 bytes)
+        // Verify we have enough data for the ITCH message (25 bytes)
         void *payload = (void *)(udp + 1);
-        if (payload + 17 > data_end) {
+        if (payload + 25 > data_end) {
             // Packet too small, pass to kernel
             update_stats(STATS_PASSED, 1);
             return XDP_PASS;
